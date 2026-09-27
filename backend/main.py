@@ -1,13 +1,18 @@
-import re
+import os
 from typing import Any, Literal
 
+import openai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 from mock_jobs import confirm_job, get_job, prepare_job, resolve_transaction
 from policy_items import merge_duplicate_items
-from policy_prompt import detect_explicit_currency, detect_explicit_period_days
+from policy_prompt import (
+    build_policy_extraction_messages,
+    detect_explicit_currency,
+    detect_explicit_period_days,
+)
 
 
 Currency = Literal["CHF", "USD", "EUR"]
@@ -83,6 +88,42 @@ class WalletPolicy(BaseModel):
         return self
 
 
+class DraftSpending(BaseModel):
+    total_price_max: float | None = None
+    currency: Currency | None = None
+    period_in_days: int | None = None
+
+
+class DraftProductItem(BaseModel):
+    name: str | None = None
+    category: ProductCategory | None = None
+    quantity: int | None = None
+    max_price_per_item: float | None = None
+
+
+class DraftProducts(BaseModel):
+    items: list[DraftProductItem] | None = None
+
+
+class DraftMerchant(BaseModel):
+    blocklist: list[str] | None = None
+    allowlist: list[str] | None = None
+
+
+class DraftOrderTerms(BaseModel):
+    require_returnable: bool | None = None
+    require_cancellable: bool | None = None
+
+
+class DraftWalletPolicy(BaseModel):
+    raw_instructions: str
+    products: DraftProducts
+    spending: DraftSpending
+    merchant: DraftMerchant
+    order_terms: DraftOrderTerms
+    notes_for_customer: str | None = ""
+
+
 class PolicyRequest(BaseModel):
     wallet_id: int = Field(ge=0, le=31)
     policy_text: str = Field(min_length=1)
@@ -127,107 +168,32 @@ def identify() -> dict[str, str]:
     return {
         "service": "leash-agentic-commerce-demo",
         "data": "generated-fictional-only",
-        "mode": "mock",
+        "policy_parser": "local-ollama",
+        "transaction_mode": "mock",
     }
 
 
-_CATEGORY_KEYWORDS: tuple[tuple[ProductCategory, tuple[str, ...]], ...] = (
-    ("sporting_goods", ("running shoe", "sports shoe", "water bottle", "football", "tennis")),
-    ("books", ("book", "ebook", "audiobook")),
-    ("electronics", ("monitor", "laptop", "computer", "phone", "headphone", "camera")),
-    ("groceries", ("grocer", "ingredient", "vegetable", "fruit")),
-    ("food_delivery", ("food delivery", "delivered meal")),
-    ("dining", ("restaurant", "dinner", "lunch", "coffee")),
-    ("clothing", ("shirt", "jacket", "dress", "clothing", "fashion shoe")),
-    ("cosmetics", ("cosmetic", "makeup", "skincare", "perfume")),
-    ("fuel", ("fuel", "petrol", "diesel", "charging")),
-    ("gift_card", ("gift card", "voucher")),
-    ("home_improvement", ("tool", "building supply", "renovation")),
-    ("hotel", ("hotel", "accommodation")),
-    ("household", ("furniture", "cleaning", "kitchenware")),
-    ("membership", ("membership", "gym")),
-    ("subscriptions", ("subscription", "streaming")),
-    ("transport", ("train", "flight", "taxi", "transport", "ride")),
-)
-
-
-def _extract_category(text: str) -> tuple[str, ProductCategory]:
-    lowered = text.casefold()
-    for category, keywords in _CATEGORY_KEYWORDS:
-        for keyword in keywords:
-            if keyword in lowered:
-                return keyword, category
-    return "requested item", "household"
-
-
-def _extract_quantity(text: str, item_name: str) -> int:
-    words = {
-        "one": 1,
-        "two": 2,
-        "three": 3,
-        "four": 4,
-        "five": 5,
-    }
-    match = re.search(
-        rf"\b(\d+|{'|'.join(words)})\s+(?:pairs?\s+of\s+)?{re.escape(item_name)}s?\b",
-        text,
-        re.IGNORECASE,
+def parse_with_ollama(text: str) -> DraftWalletPolicy:
+    """Extract a policy with the user's local Ollama server; no cloud key is used."""
+    client = openai.OpenAI(
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+        # The OpenAI client requires a non-empty value. Ollama ignores it.
+        api_key="ollama-local",
     )
-    if not match:
-        return 1
-    raw = match.group(1).casefold()
-    return int(raw) if raw.isdigit() else words[raw]
-
-
-def _extract_amount(text: str) -> float | None:
-    patterns = (
-        r"(?i)(?:CHF|USD|EUR|SFr\.?|\$|€)\s*(\d+(?:[.,]\d{1,2})?)",
-        r"(?i)(\d+(?:[.,]\d{1,2})?)\s*(?:CHF|USD|EUR|francs?|franks?|euros?|dollars?)",
-        r"(?i)(?:under|up to|at most|maximum|max|budget(?: of)?)\s*(\d+(?:[.,]\d{1,2})?)",
+    completion = client.beta.chat.completions.parse(
+        model=os.getenv("OLLAMA_MODEL", "llama3.2"),
+        messages=build_policy_extraction_messages(text),
+        response_format=DraftWalletPolicy,
+        temperature=0,
     )
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return float(match.group(1).replace(",", "."))
-    return None
+    parsed = completion.choices[0].message.parsed
+    if parsed is None:
+        raise ValueError("The local Ollama model did not return a parsed policy.")
 
-
-def parse_policy_text(text: str) -> dict[str, Any]:
-    """Create an editable demo draft without any external API or private data."""
-    item_name, category = _extract_category(text)
-    currency = detect_explicit_currency(text)
-    amount = _extract_amount(text)
-    period = detect_explicit_period_days(text)
-    lowered = text.casefold()
-    draft = {
-        "raw_instructions": text,
-        "products": {
-            "items": merge_duplicate_items(
-                [
-                    {
-                        "name": item_name,
-                        "category": category,
-                        "quantity": _extract_quantity(text, item_name),
-                        "max_price_per_item": None,
-                    }
-                ]
-            )
-        },
-        "spending": {
-            "total_price_max": amount,
-            "currency": currency,
-            "period_in_days": period,
-        },
-        "merchant": {"blocklist": [], "allowlist": []},
-        "order_terms": {
-            "require_returnable": "not returnable" not in lowered,
-            "require_cancellable": "not cancellable" not in lowered,
-        },
-        "notes_for_customer": (
-            "This public demo uses a deterministic local parser. Review the extracted rules before confirming."
-        ),
-    }
-    return draft
+    # Keep critical values deterministic instead of allowing model guesses.
+    parsed.spending.currency = detect_explicit_currency(text)
+    parsed.spending.period_in_days = detect_explicit_period_days(text)
+    return parsed
 
 
 def check_missing_fields(draft: dict[str, Any]) -> list[str]:
@@ -259,7 +225,30 @@ def parse_policy(request: PolicyRequest) -> PolicyResponse:
     combined_text = request.policy_text.strip()
     if request.additional_text:
         combined_text += f"\nAdditional constraints: {request.additional_text.strip()}"
-    draft = parse_policy_text(combined_text)
+    try:
+        parsed = parse_with_ollama(combined_text)
+    except openai.APIConnectionError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot reach local Ollama. Start Ollama and run "
+                "`ollama pull llama3.2`, then try again."
+            ),
+        ) from error
+    except (openai.APIError, ValueError) as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Local Ollama policy extraction failed: {error}",
+        ) from error
+
+    draft = parsed.model_dump()
+    products = draft.setdefault("products", {})
+    products["items"] = merge_duplicate_items(products.get("items") or []) or None
+    order_terms = draft.setdefault("order_terms", {})
+    if order_terms.get("require_returnable") is None:
+        order_terms["require_returnable"] = True
+    if order_terms.get("require_cancellable") is None:
+        order_terms["require_cancellable"] = True
     missing = check_missing_fields(draft)
     return PolicyResponse(
         walletId=request.wallet_id,

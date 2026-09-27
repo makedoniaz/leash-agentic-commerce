@@ -1,10 +1,11 @@
 from fastapi.testclient import TestClient
+from unittest.mock import patch
 
-from main import app
+import main
 from mock_jobs import reset_jobs
 
 
-client = TestClient(app)
+client = TestClient(main.app)
 
 
 def setup_function() -> None:
@@ -12,13 +13,27 @@ def setup_function() -> None:
 
 
 def test_complete_public_demo_flow() -> None:
-    parsed_response = client.post(
-        "/parse-policy",
-        json={
-            "wallet_id": 0,
-            "policy_text": "Buy one pair of running shoes under CHF 120.",
-        },
+    ollama_result = main.DraftWalletPolicy(
+        raw_instructions="Buy one pair of running shoes under CHF 120.",
+        products={"items": [{
+            "name": "running shoes",
+            "category": "sporting_goods",
+            "quantity": 1,
+            "max_price_per_item": None,
+        }]},
+        spending={"total_price_max": 120, "currency": "CHF", "period_in_days": None},
+        merchant={"blocklist": [], "allowlist": []},
+        order_terms={"require_returnable": True, "require_cancellable": True},
+        notes_for_customer="",
     )
+    with patch("main.parse_with_ollama", return_value=ollama_result):
+        parsed_response = client.post(
+            "/parse-policy",
+            json={
+                "wallet_id": 0,
+                "policy_text": "Buy one pair of running shoes under CHF 120.",
+            },
+        )
     assert parsed_response.status_code == 200
     parsed = parsed_response.json()
     assert parsed["complete"] is True
